@@ -8,7 +8,8 @@ case class SegmentBackfillResult(
     rowCount: Long,
     manifestPaths: Seq[String],
     outputPath: String,
-    executionTimeMs: Long
+    executionTimeMs: Long,
+    committedVersion: Long = -1
 )
 
 /**
@@ -46,10 +47,38 @@ case class BackfillResult(
    */
   def segmentSummary: String = {
     val segmentLines = segmentResults.toSeq.sortBy(_._1).map { case (segId, result) =>
-      s"    Segment $segId: ${result.rowCount} rows, ${result.executionTimeMs}ms, ${result.manifestPaths.size} manifests"
+      s"    Segment $segId: ${result.rowCount} rows, version=${result.committedVersion}, ${result.executionTimeMs}ms, path=${result.outputPath}"
     }
     s"Segment Details:\n${segmentLines.mkString("\n")}"
   }
+
+  /**
+   * Serialize this result to a JSON string
+   */
+  def toJson: String = {
+    val segmentsJson = segmentResults.toSeq.sortBy(_._1).map { case (segId, r) =>
+      val manifestPathsJson = r.manifestPaths.map(p => s""""${escapeJson(p)}"""").mkString("[", ", ", "]")
+      s"""    "$segId": {"version": ${r.committedVersion}, "rowCount": ${r.rowCount}, "executionTimeMs": ${r.executionTimeMs}, "outputPath": "${escapeJson(r.outputPath)}", "manifestPaths": $manifestPathsJson}"""
+    }.mkString(",\n")
+
+    val newFieldNamesJson = newFieldNames.map(n => s""""${escapeJson(n)}"""").mkString("[", ", ", "]")
+
+    s"""{
+       |  "success": $success,
+       |  "collectionId": $collectionId,
+       |  "partitionId": $partitionId,
+       |  "segmentsProcessed": $segmentsProcessed,
+       |  "totalRowsWritten": $totalRowsWritten,
+       |  "executionTimeMs": $executionTimeMs,
+       |  "newFieldNames": $newFieldNamesJson,
+       |  "segments": {
+       |$segmentsJson
+       |  }
+       |}""".stripMargin
+  }
+
+  private def escapeJson(s: String): String =
+    s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
 
   /**
    * Check if all segments were processed successfully
