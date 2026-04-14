@@ -143,7 +143,7 @@ object BackfillApp {
         "--column-mapping cannot be empty"
       )
     }
-    trimmed
+    val pairs = trimmed
       .split(",")
       .map(_.trim)
       .filter(_.nonEmpty)
@@ -157,7 +157,19 @@ object BackfillApp {
             )
         }
       }
-      .toMap
+      .toSeq
+    // Duplicate sources silently collapse under `.toMap`; fail fast, mirroring
+    // how applyColumnMapping rejects duplicate targets.
+    val dupSrc = pairs
+      .groupBy(_._1)
+      .collect { case (k, vs) if vs.size > 1 => k }
+      .toSeq
+    if (dupSrc.nonEmpty) {
+      throw new IllegalArgumentException(
+        s"--column-mapping has duplicate source columns: ${dupSrc.mkString(", ")}"
+      )
+    }
+    pairs.toMap
   }
 
   private[backfill] def parseArgs(args: Array[String]): Map[String, String] = {

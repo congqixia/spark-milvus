@@ -324,6 +324,19 @@ object MilvusBackfill {
             )
           )
         }
+        // If the parquet already has a column named pkName, the implicit
+        // {pk→pkName} rename would collide with it. Surface a dedicated error
+        // rather than letting the generic duplicate-target check fire and
+        // reference "column mapping" — users in the legacy path never passed
+        // --column-mapping.
+        if (pkName != "pk" && colSet.contains(pkName)) {
+          return Left(
+            SchemaValidationError(
+              s"Backfill parquet contains both a 'pk' column and a column named '$pkName' " +
+                s"(the collection's primary-key field). Remove one, or supply --column-mapping to disambiguate."
+            )
+          )
+        }
         cols.map(c => if (c == "pk") c -> pkName else c -> c).toMap
     }
 
@@ -370,14 +383,13 @@ object MilvusBackfill {
       )
     }
 
-    // Project, then rename. Use the mapping key order from the original parquet
-    // schema to keep the output stable / deterministic.
+    // Single-pass aliased select. A foldLeft of withColumnRenamed would rename
+    // sequentially and corrupt chains like {a→b, b→c} (the second rename would
+    // hit the already-renamed column) and swaps like {a→b, b→a}.
     val orderedKeys = cols.filter(mapping.contains)
-    val projected = df.select(orderedKeys.map(df.col): _*)
-    val renamed = orderedKeys.foldLeft(projected) { (acc, src) =>
-      val tgt = mapping(src)
-      if (src == tgt) acc else acc.withColumnRenamed(src, tgt)
-    }
+    val renamed = df.select(
+      orderedKeys.map(src => df.col(src).as(mapping(src))): _*
+    )
     Right(renamed)
   }
 
