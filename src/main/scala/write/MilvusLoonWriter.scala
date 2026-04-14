@@ -283,14 +283,20 @@ class MilvusLoonPartitionWriter(
       val transaction = new MilvusStorageTransaction()
       transaction.begin(basePath, writerProperties)
 
-      // Determine commit type: ADDFIELD (1) for backfill, ADDFILES (0) for normal writes
-      val commitType = milvusOption.options.get(
+      milvusOption.options.get(
         MilvusOption.WriterCommitType.toLowerCase
       ) match {
-        case Some("addfield") => 1 // ADDFIELD
-        case _                => 0 // ADDFILES (default)
+        case Some("addfield") =>
+          // Backfill = column replacement: drop each target column (noop if
+          // absent) then add the new column groups in the same transaction.
+          // Native commit orders DropColumn before AddColumnGroup validation,
+          // so this is atomic per-column overwrite.
+          sparkSchema.fields.foreach(f => transaction.dropColumn(f.name))
+          transaction.addColumnGroups(columnGroupsPtr)
+        case _ =>
+          transaction.appendFiles(columnGroupsPtr)
       }
-      val committedVersion = transaction.commit(commitType, 0, columnGroupsPtr)
+      val committedVersion = transaction.commit()
       transaction.destroy()
 
       if (committedVersion < 0) {
