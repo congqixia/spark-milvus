@@ -158,7 +158,7 @@ class ColumnMappingTest
     val df = buildDf(Seq("id", "vec"), Seq(Seq(1, "v1")))
     val result = MilvusBackfill.applyColumnMapping(df, "id", None)
     result.isLeft shouldBe true
-    result.left.toOption.get shouldBe a[DataReadError]
+    result.left.toOption.get shouldBe a[SchemaValidationError]
     result.left.toOption.get.message should include("'pk' column")
   }
 

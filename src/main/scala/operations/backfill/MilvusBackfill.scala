@@ -317,10 +317,8 @@ object MilvusBackfill {
         // Legacy: require a literal "pk" column; transparently rename it to pkName.
         if (!colSet.contains("pk")) {
           return Left(
-            DataReadError(
-              path = "",
-              message =
-                "Backfill parquet must contain a 'pk' column (or supply --column-mapping to rename the PK column)"
+            SchemaValidationError(
+              "Backfill parquet must contain a 'pk' column (or supply --column-mapping to rename the PK column)"
             )
           )
         }
