@@ -69,9 +69,13 @@ object V2SegmentLoader extends Logging {
             s"skipping segment ${entry.segmentId}: storage_version=${entry.storageVersion} " +
               s"(!= 2); V2SegmentLoader only handles StorageV2"
           )
-        } else if (entry.binlogFiles.isEmpty) {
+        } else if (
+          entry.binlogFiles.isEmpty ||
+          entry.binlogFiles.forall(_.binlogs.isEmpty)
+        ) {
           logWarning(
-            s"segment ${entry.segmentId} has no binlog_files; emitting as empty column-group list"
+            s"segment ${entry.segmentId} has no binlog files with entries; " +
+              s"emitting as empty column-group list"
           )
           out += V2SegmentInfo(
             segmentId = entry.segmentId,
@@ -82,8 +86,14 @@ object V2SegmentLoader extends Logging {
           )
         } else {
           // Any one of this segment's parquet files carries the full
-          // `group_field_id_list` in its kv-metadata.
-          val sample = entry.binlogFiles.head.binlogs.head.logPath
+          // `group_field_id_list` in its kv-metadata. Skip any binlog_files
+          // entry that happens to be empty.
+          val sample = entry.binlogFiles
+            .find(_.binlogs.nonEmpty)
+            .get
+            .binlogs
+            .head
+            .logPath
           val footerPath = resolvePath(sample, bucket)
           val footer =
             MilvusParquetFooterReader.read(footerPath, hadoopConf) match {

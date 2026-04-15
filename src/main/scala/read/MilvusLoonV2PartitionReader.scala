@@ -14,6 +14,7 @@ import io.milvus.grpc.schema.CollectionSchema
 import io.milvus.storage.{
   ArrowUtils,
   MilvusStorageColumnGroups,
+  MilvusStorageProperties,
   MilvusStorageReader,
   NativeLibraryLoader
 }
@@ -61,24 +62,13 @@ class MilvusLoonV2PartitionReader(
   private val fieldNameToId: Map[String, Long] =
     fieldIdToName.map { case (id, name) => name -> id }
 
-  // Arrow schema for the read: columns named by their logical names so the
-  // packed reader can find them by name in the on-disk parquet.
-  private val (arrowSchemaObj, arrowSchemaPtr) = {
-    val arrowSchema =
-      com.zilliz.spark.connector.MilvusSchemaUtil.convertToArrowSchema(
-        milvusSchema
-      )
-    val arrowSchemaC = ArrowSchema.allocateNew(allocator)
-    Data.exportSchema(allocator, arrowSchema, null, arrowSchemaC)
-    (arrowSchemaC, arrowSchemaC.memoryAddress())
-  }
-
-  // ArrowConverter looks up Spark column names against this map to find the
-  // backing field id; both V2 and V3 readers share that contract.
-  private val fieldNameToIdString: Map[String, String] =
-    fieldNameToId.map { case (name, id) => name -> id.toString }
-
-  private val readerProperties = Properties.fromMilvusOption(milvusOption)
+  // V3 readers pass a {sparkName -> fieldId-as-string} map to ArrowConverter
+  // because their on-disk parquet uses fieldId-as-string column names. V2
+  // packed parquet uses LOGICAL names (e.g. "ID"), so we must NOT remap —
+  // ArrowConverter calls `root.getVector(field.name)` directly when the
+  // mapping is empty, which is exactly what we need here. Remapping would
+  // make it look up a non-existent column and silently null every cell.
+  private val fieldNameToArrowColumn: Map[String, String] = Map.empty
 
   // Which column names to ask the packed reader for. Prefer explicit
   // projection from neededColumnFieldIds; fall back to sourceSchema's Spark
@@ -96,12 +86,34 @@ class MilvusLoonV2PartitionReader(
     explicitNames.filter(name => declared.contains(name)).toArray
   }
 
-  // Build LoonColumnGroups directly from the materialized v2 layout. Each
-  // group's `columns` is the LOGICAL names of its fields (matching what
-  // milvus segcore wrote into the parquet). Row counts (per file) come from
-  // the AVRO's AvroBinlog.entries_num — required because the packed reader
-  // rejects negative end indices.
-  private val columnGroupsPtr: Long = {
+  // Native resource handles. Initialized to safe defaults so a partial-init
+  // failure can roll back whatever was allocated so far. Spark only calls
+  // close() on a fully-constructed reader; any throw from the init block
+  // below has to release its own resources before bubbling out.
+  private var arrowSchemaObj: ArrowSchema = null
+  private var readerProperties: MilvusStorageProperties = null
+  private var columnGroupsPtr: Long = 0L
+  private var reader: MilvusStorageReader = null
+  private var arrowArrayStream: ArrowArrayStream = null
+  private var arrowReader: org.apache.arrow.vector.ipc.ArrowReader = null
+
+  try {
+    // Arrow schema for the read: columns named by their logical names so the
+    // packed reader can find them by name in the on-disk parquet.
+    val arrowSchema =
+      com.zilliz.spark.connector.MilvusSchemaUtil.convertToArrowSchema(
+        milvusSchema
+      )
+    arrowSchemaObj = ArrowSchema.allocateNew(allocator)
+    Data.exportSchema(allocator, arrowSchema, null, arrowSchemaObj)
+
+    readerProperties = Properties.fromMilvusOption(milvusOption)
+
+    // Build LoonColumnGroups directly from the materialized v2 layout. Each
+    // group's `columns` is the LOGICAL names of its fields (matching what
+    // milvus segcore wrote into the parquet). Row counts (per file) come
+    // from the AVRO's AvroBinlog.entries_num — required because the packed
+    // reader rejects negative end indices.
     val cols = columnGroups.map { cg =>
       cg.fieldIds.flatMap(fieldIdToName.get).toArray
     }.toArray
@@ -114,26 +126,30 @@ class MilvusLoonV2PartitionReader(
       )
       cg.fileRowCounts.toArray
     }.toArray
-    MilvusStorageColumnGroups.createFromGroups(cols, files, rowCounts)
-  }
+    columnGroupsPtr =
+      MilvusStorageColumnGroups.createFromGroups(cols, files, rowCounts)
 
-  private val reader = new MilvusStorageReader()
-  reader.create(
-    columnGroupsPtr,
-    arrowSchemaPtr,
-    neededColumns,
-    readerProperties
-  )
-
-  if (!reader.isValid) {
-    throw new IllegalStateException(
-      "Failed to create MilvusStorageReader for V2 packed segment"
+    reader = new MilvusStorageReader()
+    reader.create(
+      columnGroupsPtr,
+      arrowSchemaObj.memoryAddress(),
+      neededColumns,
+      readerProperties
     )
-  }
+    if (!reader.isValid) {
+      throw new IllegalStateException(
+        "Failed to create MilvusStorageReader for V2 packed segment"
+      )
+    }
 
-  private val recordBatchReaderPtr = reader.getRecordBatchReaderScala()
-  private val arrowArrayStream = ArrowArrayStream.wrap(recordBatchReaderPtr)
-  private val arrowReader = Data.importArrayStream(allocator, arrowArrayStream)
+    val recordBatchReaderPtr = reader.getRecordBatchReaderScala()
+    arrowArrayStream = ArrowArrayStream.wrap(recordBatchReaderPtr)
+    arrowReader = Data.importArrayStream(allocator, arrowArrayStream)
+  } catch {
+    case e: Throwable =>
+      releaseAll()
+      throw e
+  }
 
   private var _currentBatch: VectorSchemaRoot = {
     if (arrowReader.loadNextBatch()) arrowReader.getVectorSchemaRoot else null
@@ -163,25 +179,53 @@ class MilvusLoonV2PartitionReader(
       _currentBatch,
       _currentRowIndex,
       sourceSchema,
-      fieldNameToIdString
+      fieldNameToArrowColumn
     )
     _currentRowIndex += 1
     row
   }
 
-  override def close(): Unit = {
-    try {
-      if (arrowReader != null) arrowReader.close()
-      if (arrowArrayStream != null) arrowArrayStream.close()
-      if (reader != null) reader.destroy()
-      if (columnGroupsPtr != 0L) {
-        MilvusStorageColumnGroups.destroy(columnGroupsPtr)
+  override def close(): Unit = releaseAll()
+
+  // Each native resource is released in its own try-catch so one failing
+  // release doesn't strand the rest. Also reused by the constructor's
+  // failure path to roll back a partial init.
+  private def releaseAll(): Unit = {
+    if (arrowReader != null) {
+      try arrowReader.close()
+      catch { case e: Throwable => logWarning("close arrowReader failed", e) }
+      arrowReader = null
+    }
+    if (arrowArrayStream != null) {
+      try arrowArrayStream.close()
+      catch {
+        case e: Throwable => logWarning("close arrowArrayStream failed", e)
       }
-      if (arrowSchemaObj != null) arrowSchemaObj.close()
-      readerProperties.free()
-    } catch {
-      case e: Exception =>
-        logWarning("Error closing V2 packed-parquet reader", e)
+      arrowArrayStream = null
+    }
+    if (reader != null) {
+      try reader.destroy()
+      catch { case e: Throwable => logWarning("destroy reader failed", e) }
+      reader = null
+    }
+    if (columnGroupsPtr != 0L) {
+      try MilvusStorageColumnGroups.destroy(columnGroupsPtr)
+      catch {
+        case e: Throwable => logWarning("destroy columnGroupsPtr failed", e)
+      }
+      columnGroupsPtr = 0L
+    }
+    if (arrowSchemaObj != null) {
+      try arrowSchemaObj.close()
+      catch { case e: Throwable => logWarning("close arrowSchemaObj failed", e) }
+      arrowSchemaObj = null
+    }
+    if (readerProperties != null) {
+      try readerProperties.free()
+      catch {
+        case e: Throwable => logWarning("free readerProperties failed", e)
+      }
+      readerProperties = null
     }
   }
 }

@@ -1166,12 +1166,6 @@ object MilvusBackfill {
       )
     }
 
-    // Register S3A credentials for the destination bucket on this executor's
-    // Hadoop conf — the driver's registration does not propagate
-    // automatically to worker JVMs.
-    val hadoopConf = new org.apache.hadoop.conf.Configuration()
-    registerBucketForExecutor(hadoopConf, config)
-
     // Simple monotonic logID allocator seeded by task-start nanos. Plan
     // names this as a future injection point (caller-provided global ID),
     // but a monotonic local sequence is sufficient for the single-task
@@ -1183,6 +1177,19 @@ object MilvusBackfill {
     val outputRoot =
       s"s3a://${config.s3BucketName}/${config.s3RootPath.stripSuffix("/")}/insert_log/" +
         s"$collectionID/$partitionID/$segmentID"
+
+    // Reuse the same MilvusOption plumbing the V3 writer uses — the new V2
+    // writer talks to S3 via Arrow's filesystem (inside milvus-storage), so
+    // it needs the FS config, not Hadoop S3A config.
+    val writeOptions = config.getS3WriteOptionsForBasePath(
+      s"${config.s3RootPath.stripSuffix("/")}/insert_log/$collectionID/$partitionID/$segmentID",
+      segmentID,
+      fieldNameToId
+    )
+    val milvusOption = MilvusOption(
+      new CaseInsensitiveStringMap(writeOptions.asJava)
+    )
+
     val writer = new MilvusV2BinlogWriter(
       collectionId = collectionID,
       partitionId = partitionID,
@@ -1190,9 +1197,7 @@ object MilvusBackfill {
       newFieldNames = fieldNames,
       newFieldIds = fieldIds,
       targetSchema = targetSchema,
-      rootPath = config.s3RootPath,
-      bucket = config.s3BucketName,
-      hadoopConf = hadoopConf,
+      milvusOption = milvusOption,
       allocateLogId = allocator
     )
 
@@ -1261,48 +1266,6 @@ object MilvusBackfill {
             Some(e)
           )
         )
-    }
-  }
-
-  /** Configure per-bucket S3A credentials on an executor's Hadoop conf. Mirrors
-    * the shape `configureHadoopS3ForPath` installs on the driver but operates
-    * on the local Configuration rather than the SparkContext one.
-    */
-  private def registerBucketForExecutor(
-      hadoopConf: org.apache.hadoop.conf.Configuration,
-      config: BackfillConfig
-  ): Unit = {
-    val bucket = config.s3BucketName
-    if (bucket == null || bucket.isEmpty) return
-    val prefix = s"fs.s3a.bucket.$bucket"
-    if (config.s3Endpoint != null && config.s3Endpoint.nonEmpty) {
-      hadoopConf.set(s"$prefix.endpoint", config.s3Endpoint)
-    }
-    if (config.s3Region != null && config.s3Region.nonEmpty) {
-      hadoopConf.set(s"$prefix.endpoint.region", config.s3Region)
-      hadoopConf.set(s"$prefix.region", config.s3Region)
-    }
-    hadoopConf.set(s"$prefix.path.style.access", "true")
-    hadoopConf.set(
-      s"$prefix.connection.ssl.enabled",
-      if (config.s3UseSSL) "true" else "false"
-    )
-    if (config.s3UseIam) {
-      hadoopConf.set(
-        s"$prefix.aws.credentials.provider",
-        Seq(
-          "com.amazonaws.auth.WebIdentityTokenCredentialsProvider",
-          "com.amazonaws.auth.EnvironmentVariableCredentialsProvider",
-          "org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider"
-        ).mkString(",")
-      )
-    } else {
-      hadoopConf.set(s"$prefix.access.key", config.s3AccessKey)
-      hadoopConf.set(s"$prefix.secret.key", config.s3SecretKey)
-      hadoopConf.set(
-        s"$prefix.aws.credentials.provider",
-        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
-      )
     }
   }
 

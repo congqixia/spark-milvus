@@ -1,18 +1,23 @@
 package com.zilliz.spark.connector.write
 
-import java.net.URI
-import java.util.{HashMap => JHashMap}
 import scala.collection.mutable
+import scala.util.Try
 
-import org.apache.avro.generic.{GenericData, GenericRecord}
-import org.apache.avro.Schema
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
-import org.apache.parquet.avro.AvroParquetWriter
-import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.arrow.c.{ArrowArray, ArrowSchema, Data}
+import org.apache.arrow.memory.RootAllocator
+import org.apache.arrow.vector.{
+  BaseVariableWidthVector,
+  VectorSchemaRoot,
+  VarCharVector
+}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.types._
+
+import com.zilliz.spark.connector.{MilvusOption, MilvusSchemaUtil}
+import com.zilliz.spark.connector.loon.Properties
+import com.zilliz.spark.connector.serde.ArrowConverter
+import io.milvus.storage.{MilvusPackedWriter, MilvusStorageProperties}
 
 /** Describes one parquet file produced by a backfill write into a StorageV2
   * (non-manifest packed parquet) segment.
@@ -23,7 +28,7 @@ import org.apache.spark.sql.types._
   *   The `logID` we allocated for this file (also the last path segment).
   * @param path
   *   Bucket-relative path under `insert_log/...` ready to be stored back in the
-  *   snapshot AVRO.
+  *   snapshot AVRO. Does NOT include scheme or bucket prefix.
   * @param rowsWritten
   *   Row count actually written (for validation / result JSON).
   */
@@ -41,10 +46,16 @@ case class V2BinlogFile(
   * {{{
   *   {rootPath}/insert_log/{coll}/{part}/{seg}/{fieldID}/{logID}
   * }}}
-  * with the kv-metadata milvus expects for StorageV2:
-  *   - `storage_version = "1.0.0"` (parquet-level)
-  *   - `group_field_id_list = "{fieldID}"` (single-field group)
-  * and the Arrow-compatible field metadata `PARQUET:field_id = "{fieldID}"`.
+  *
+  * Files are produced via milvus-storage's [[io.milvus.storage.MilvusPackedWriter]]
+  * (the JNI wrapper around C++ `PackedRecordBatchWriter`), so the on-disk
+  * footer carries milvus-storage's full KV metadata trio:
+  *   - `row_group_metadata` (per-row-group memsize/rownum/offset)
+  *   - `storage_version = "1.0.0"`
+  *   - `group_field_id_list = "{fieldID}"`
+  * matching what Milvus's compaction worker produces — so the resulting
+  * segment loads cleanly via `FileRowGroupReader::Make` /
+  * `PackedFileMetadata::Make`.
   *
   * The writer is NOT thread-safe; create one per segment on the executor.
   *
@@ -57,9 +68,7 @@ class MilvusV2BinlogWriter(
     newFieldNames: Seq[String], // positional in targetSchema
     newFieldIds: Seq[Long], // same size as newFieldNames
     targetSchema: StructType, // one StructField per new field, no metadata cols
-    rootPath: String, // bucket-relative root (usually "files")
-    bucket: String, // s3a bucket for full-path construction
-    hadoopConf: Configuration,
+    milvusOption: MilvusOption,
     allocateLogId: () => Long
 ) extends Logging {
 
@@ -69,165 +78,209 @@ class MilvusV2BinlogWriter(
       s"${newFieldNames.size} / ${newFieldIds.size} / ${targetSchema.fields.length}"
   )
 
-  private case class PerFieldState(
+  // Storage root comes from the same FS config the V3 writer already consumes
+  // — see com.zilliz.spark.connector.loon.Properties. Paths passed to the
+  // native writer are bucket-relative keys: milvus-storage's FilesystemCache
+  // wraps the raw S3 filesystem in a FileSystemProxy(bucket, s3_fs) subtree,
+  // so the bucket is prepended automatically. Passing "<bucket>/<key>" would
+  // produce doubled-bucket paths like "a-bucket/a-bucket/files/...".
+  private val rootPath: String = milvusOption.options
+    .getOrElse(Properties.FsConfig.FsRootPath, "files")
+    .stripSuffix("/")
+
+  private case class PerFieldEntry(
       fieldId: Long,
       logId: Long,
-      bucketRelativePath: String,
-      schema: Schema,
-      writer: org.apache.parquet.hadoop.ParquetWriter[GenericRecord],
-      var rowCount: Long
+      bucketRelativePath: String
   )
 
-  private val fields: Array[PerFieldState] = newFieldNames.zipWithIndex.map {
-    case (name, idx) =>
-      val fid = newFieldIds(idx)
-      val logId = allocateLogId()
-      val bucketRelative =
-        s"${rootPath.stripSuffix("/")}/insert_log/$collectionId/$partitionId/$segmentId/$fid/$logId"
-      val fullPath = s"s3a://${bucket.stripPrefix("/")}/$bucketRelative"
-      val sparkField = targetSchema.fields(idx)
-      val avroSchema = buildSingleFieldSchema(name, sparkField.dataType, fid)
-      val kv = new JHashMap[String, String]()
-      // StorageV2's parquet-level kv-metadata as observed on real milvus files.
-      kv.put("storage_version", "1.0.0")
-      // Single-field group: the kv value is just the field id as a plain
-      // string (verified against the v2 sample with group_field_id_list
-      // == "100,0,1;101;102" — a single-field file would omit the separator).
-      kv.put("group_field_id_list", fid.toString)
-      val writer = AvroParquetWriter
-        .builder[GenericRecord](new Path(new URI(fullPath)))
-        .withSchema(avroSchema)
-        .withDataModel(GenericData.get())
-        .withCompressionCodec(CompressionCodecName.ZSTD)
-        .withConf(hadoopConf)
-        .withExtraMetaData(kv)
-        .build()
-      PerFieldState(fid, logId, bucketRelative, avroSchema, writer, 0L)
+  private val fields: Array[PerFieldEntry] = newFieldNames.indices.map { idx =>
+    val fid = newFieldIds(idx)
+    val logId = allocateLogId()
+    val bucketRelative =
+      s"$rootPath/insert_log/$collectionId/$partitionId/$segmentId/$fid/$logId"
+    PerFieldEntry(fid, logId, bucketRelative)
   }.toArray
+
+  // Allocator + Arrow schema for the WHOLE row (all N new fields together).
+  // The packed writer splits per column group internally, so we feed it
+  // batches that contain every column.
+  private val allocator = new RootAllocator(Long.MaxValue)
+  private val fieldNameToId: Map[String, Long] =
+    newFieldNames.zip(newFieldIds).toMap
+  private val arrowSchema =
+    MilvusSchemaUtil.convertSparkSchemaToArrow(
+      targetSchema,
+      vectorDimensions = Map.empty,
+      fieldIds = fieldNameToId
+    )
+
+  // Single-field column groups: one parquet output per field, paths in the
+  // same order as `targetSchema.fields`.
+  private val columnGroups: Array[Array[Int]] =
+    Array.tabulate(newFieldNames.length)(i => Array(i))
+  private val outputPaths: Array[String] = fields.map(_.bucketRelativePath)
+
+  // Build native properties from the carrier MilvusOption (same plumbing the
+  // V3 writer uses).
+  private val nativeProperties: MilvusStorageProperties =
+    Properties.fromMilvusOption(milvusOption)
+
+  // Open the native writer.
+  private val arrowSchemaC: ArrowSchema = ArrowSchema.allocateNew(allocator)
+  Data.exportSchema(allocator, arrowSchema, null, arrowSchemaC)
+
+  private val writer: MilvusPackedWriter = {
+    val w = new MilvusPackedWriter()
+    try {
+      w.create(
+        outputPaths,
+        columnGroups,
+        arrowSchemaC.memoryAddress(),
+        nativeProperties,
+        bufferSize = 0L
+      )
+    } catch {
+      case e: Throwable =>
+        // Cleanup partial state before rethrowing — the caller's `abort()` won't
+        // run if the constructor itself threw.
+        Try(arrowSchemaC.close())
+        Try(nativeProperties.free())
+        Try(allocator.close())
+        throw e
+    }
+    w
+  }
+  logInfo(
+    s"V2 packed writer opened: segment=$segmentId, fields=${newFieldIds.mkString(",")}, " +
+      s"paths=${outputPaths.mkString("[", ", ", "]")}"
+  )
+
+  // Batch accumulation. The current `root` collects rows; each flush exports
+  // it via the Arrow C Data Interface. The C++ writer caches RecordBatch
+  // shared_ptrs that wrap the JVM-owned buffers (zero-copy), so we MUST
+  // keep flushed roots alive until the writer is closed — same trap
+  // documented in MilvusLoonPartitionWriter.
+  private val batchSize: Int =
+    if (milvusOption.insertMaxBatchSize > 0) milvusOption.insertMaxBatchSize
+    else 5000
+  private var root: VectorSchemaRoot =
+    VectorSchemaRoot.create(arrowSchema, allocator)
+  allocateVectors(root)
+  private var currentBatchSize: Int = 0
+  private var totalRows: Long = 0L
+  private val exportedRoots = new java.util.ArrayList[VectorSchemaRoot]()
+  private var closed: Boolean = false
 
   /** Consume one Spark row. Each field in `row` must be at the same positional
     * index as its entry in `targetSchema`.
     */
   def write(row: InternalRow): Unit = {
-    var i = 0
-    while (i < fields.length) {
-      val state = fields(i)
-      val sparkField = targetSchema.fields(i)
-      val value = extractValue(row, i, sparkField.dataType)
-      val rec = new GenericData.Record(state.schema)
-      rec.put(sparkField.name, value)
-      state.writer.write(rec)
-      state.rowCount += 1
-      i += 1
+    if (closed) throw new IllegalStateException("writer already closed")
+    ArrowConverter.internalRowToArrow(root, currentBatchSize, row, targetSchema)
+    currentBatchSize += 1
+    root.setRowCount(currentBatchSize)
+    if (currentBatchSize >= batchSize) {
+      flushBatch()
     }
   }
 
   /** Close all per-field writers and return the list of produced binlog files.
     */
   def close(): Seq[V2BinlogFile] = {
-    val out = mutable.ArrayBuffer.empty[V2BinlogFile]
-    var firstErr: Throwable = null
-    fields.foreach { state =>
-      try state.writer.close()
-      catch {
-        case e: Throwable if firstErr == null => firstErr = e
-        case e: Throwable =>
-          logWarning(s"secondary close error for fieldId=${state.fieldId}", e)
-      }
-      out += V2BinlogFile(
-        fieldId = state.fieldId,
-        logId = state.logId,
-        path = state.bucketRelativePath,
-        rowsWritten = state.rowCount
+    if (closed) {
+      return fields.map(f =>
+        V2BinlogFile(f.fieldId, f.logId, f.bucketRelativePath, totalRows)
       )
+    }
+    var firstErr: Throwable = null
+    try {
+      if (currentBatchSize > 0) flushBatch()
+      writer.close()
+    } catch {
+      case e: Throwable => firstErr = e
+    } finally {
+      cleanup()
+      closed = true
     }
     if (firstErr != null) throw firstErr
-    out.toSeq
+
+    // Every field receives the same row count: each Spark row produces one
+    // value in every field's parquet (single-field column groups).
+    fields.map(f =>
+      V2BinlogFile(f.fieldId, f.logId, f.bucketRelativePath, totalRows)
+    ).toSeq
   }
 
-  /** Abort: best-effort close of any open writers. Errors are logged, not
-    * thrown — we want the surrounding `try`/`catch` to surface the *original*
-    * exception, not a secondary abort failure.
+  /** Abort: best-effort destroy + resource release. Errors are logged, not
+    * thrown — the caller's surrounding `try`/`catch` should surface the
+    * original exception, not a secondary abort failure.
     */
   def abort(): Unit = {
-    fields.foreach { state =>
-      try state.writer.close()
-      catch {
-        case e: Throwable =>
-          logWarning(
-            s"abort: error closing writer for fieldId=${state.fieldId}",
-            e
-          )
-      }
-    }
+    if (closed) return
+    cleanup()
+    closed = true
   }
 
   // -------------------------------------------------------------------------
-  // Private: Avro schema + value extraction
-  // -------------------------------------------------------------------------
 
-  /** Build an Avro record schema for one field. The field is always nullable
-    * (union[null, T]) to match Milvus's nullability-by-default convention and
-    * to tolerate backfill data that contains NULLs for un-joined rows.
-    */
-  private def buildSingleFieldSchema(
-      fieldName: String,
-      dataType: DataType,
-      fieldId: Long
-  ): Schema = {
-    val inner = sparkTypeToAvro(dataType)
-    val nullable = Schema.createUnion(Schema.create(Schema.Type.NULL), inner)
-    val recordName = s"MilvusBinlogField_$fieldId"
-    val rec = Schema.createRecord(recordName, null, "com.zilliz.milvus", false)
-    val field =
-      new Schema.Field(fieldName, nullable, null, null.asInstanceOf[AnyRef])
-    // Arrow parquet readers (including milvus-storage) match columns by
-    // PARQUET:field_id metadata. Set it so the read side can find our column
-    // by its milvus field id regardless of the logical name.
-    field.addProp("PARQUET:field_id", fieldId.toString)
-    rec.setFields(java.util.Arrays.asList(field))
-    rec
-  }
+  private def flushBatch(): Unit = {
+    if (currentBatchSize == 0) return
+    root.setRowCount(currentBatchSize)
 
-  private def sparkTypeToAvro(dt: DataType): Schema = dt match {
-    case BooleanType => Schema.create(Schema.Type.BOOLEAN)
-    case IntegerType | ShortType | ByteType => Schema.create(Schema.Type.INT)
-    case LongType                           => Schema.create(Schema.Type.LONG)
-    case FloatType                          => Schema.create(Schema.Type.FLOAT)
-    case DoubleType                         => Schema.create(Schema.Type.DOUBLE)
-    case StringType                         => Schema.create(Schema.Type.STRING)
-    case BinaryType                         => Schema.create(Schema.Type.BYTES)
-    case _ =>
-      throw new IllegalArgumentException(
-        s"unsupported new-field data type for StorageV2 backfill: $dt. " +
-          "Scalar types (bool/int/long/float/double/string/binary) are supported " +
-          "in this phase; vector types require additional work."
-      )
-  }
+    val cArray = ArrowArray.allocateNew(allocator)
+    try {
+      Data.exportVectorSchemaRoot(allocator, root, null, cArray)
+      writer.write(cArray.memoryAddress())
+      totalRows += currentBatchSize
 
-  /** Pull a single field's value out of an InternalRow and normalize it to an
-    * Avro-compatible Java object.
-    */
-  private def extractValue(
-      row: InternalRow,
-      idx: Int,
-      dataType: DataType
-  ): AnyRef = {
-    if (row.isNullAt(idx)) return null
-    dataType match {
-      case BooleanType => java.lang.Boolean.valueOf(row.getBoolean(idx))
-      case ByteType    => java.lang.Integer.valueOf(row.getByte(idx).toInt)
-      case ShortType   => java.lang.Integer.valueOf(row.getShort(idx).toInt)
-      case IntegerType => java.lang.Integer.valueOf(row.getInt(idx))
-      case LongType    => java.lang.Long.valueOf(row.getLong(idx))
-      case FloatType   => java.lang.Float.valueOf(row.getFloat(idx))
-      case DoubleType  => java.lang.Double.valueOf(row.getDouble(idx))
-      case StringType  => row.getUTF8String(idx).toString
-      case BinaryType  => java.nio.ByteBuffer.wrap(row.getBinary(idx))
-      case _ =>
-        throw new IllegalArgumentException(
-          s"unsupported value extraction for data type $dataType at idx=$idx"
-        )
+      // CRITICAL: do NOT reuse `root`. C++ caches RecordBatch ptrs into
+      // these buffers. Hand the old root off to `exportedRoots` (closed
+      // after writer.close()) and create a fresh one for subsequent rows.
+      exportedRoots.add(root)
+      root = VectorSchemaRoot.create(arrowSchema, allocator)
+      allocateVectors(root)
+      currentBatchSize = 0
+    } finally {
+      cArray.close()
     }
+  }
+
+  private def allocateVectors(r: VectorSchemaRoot): Unit = {
+    import scala.collection.JavaConverters._
+    r.getFieldVectors.asScala.foreach {
+      case v: VarCharVector =>
+        v.setInitialCapacity(batchSize, batchSize.toLong * 32L)
+      case v: BaseVariableWidthVector =>
+        v.setInitialCapacity(batchSize, batchSize.toLong * 32L)
+      case other =>
+        other.setInitialCapacity(batchSize)
+    }
+    r.allocateNew()
+    r.setRowCount(0)
+  }
+
+  private def cleanup(): Unit = {
+    Try(writer.destroy()).failed.foreach(e =>
+      logError(s"error destroying packed writer: ${e.getMessage}")
+    )
+    Try(if (root != null) root.close()).failed.foreach(e =>
+      logError(s"error closing current root: ${e.getMessage}")
+    )
+    Try {
+      exportedRoots.forEach(r => Try(r.close()))
+      exportedRoots.clear()
+    }.failed.foreach(e =>
+      logError(s"error closing exported roots: ${e.getMessage}")
+    )
+    Try(if (arrowSchemaC != null) arrowSchemaC.close()).failed.foreach(e =>
+      logError(s"error closing ArrowSchema: ${e.getMessage}")
+    )
+    Try(nativeProperties.free()).failed.foreach(e =>
+      logError(s"error freeing native properties: ${e.getMessage}")
+    )
+    Try(allocator.close()).failed.foreach(e =>
+      logError(s"error closing allocator: ${e.getMessage}")
+    )
   }
 }
