@@ -248,6 +248,66 @@ class BackfillModeTest
     )
   }
 
+  // ============ validateCoalesceTypes ============
+
+  test("validateCoalesceTypes: matching types pass") {
+    val backfillSchema = StructType(
+      Seq(
+        StructField("pk", IntegerType, nullable = false),
+        StructField("f1", IntegerType, nullable = true),
+        StructField("f2", StringType, nullable = true)
+      )
+    )
+    val extras = Seq(
+      ("f1", 101L, StructField("f1", IntegerType, nullable = true)),
+      ("f2", 102L, StructField("f2", StringType, nullable = true))
+    )
+    MilvusBackfill.validateCoalesceTypes(backfillSchema, extras) shouldBe Right(
+      ()
+    )
+  }
+
+  test("validateCoalesceTypes: mismatched type rejected with clear message") {
+    // parquet sees IntegerType but snapshot says LongType — Spark's coalesce
+    // would silently widen and produce a Long binlog, breaking Milvus reads.
+    val backfillSchema = StructType(
+      Seq(
+        StructField("pk", IntegerType, nullable = false),
+        StructField("f1", IntegerType, nullable = true)
+      )
+    )
+    val extras = Seq(
+      ("f1", 101L, StructField("f1", LongType, nullable = true))
+    )
+    val err = MilvusBackfill
+      .validateCoalesceTypes(backfillSchema, extras)
+      .left
+      .toOption
+      .get
+    err shouldBe a[SchemaValidationError]
+    err.message should include("to match snapshot field types")
+    err.message should include("f1")
+    err.message should include("snapshot=bigint")
+    err.message should include("parquet=int")
+  }
+
+  test(
+    "validateCoalesceTypes: backfill missing the field is not flagged here"
+  ) {
+    // performJoin/processSegments handles missing columns via the left join.
+    // The type validator only complains when both sides have the column AND
+    // the types disagree.
+    val backfillSchema = StructType(
+      Seq(StructField("pk", IntegerType, nullable = false))
+    )
+    val extras = Seq(
+      ("f1", 101L, StructField("f1", LongType, nullable = true))
+    )
+    MilvusBackfill.validateCoalesceTypes(backfillSchema, extras) shouldBe Right(
+      ()
+    )
+  }
+
   test("coalesce mode: empty source columns degrade to full overwrite") {
     // Simulates a just-added field with no prior data: source returns null
     // everywhere, so coalesce naturally falls back to the backfill value.

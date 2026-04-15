@@ -210,6 +210,15 @@ object MilvusBackfill {
           }
         } else Seq.empty
 
+      // In coalesce mode, parquet column types must match snapshot field
+      // types exactly (see validateCoalesceTypes for rationale).
+      if (isCoalesceMode) {
+        validateCoalesceTypes(backfillDF.schema, extraReadFields) match {
+          case Left(error) => return Left(error)
+          case Right(_)    => // Continue
+        }
+      }
+
       // Read original collection data with segment metadata
       val originalDF = readCollectionWithMetadata(
         spark,
@@ -583,6 +592,41 @@ object MilvusBackfill {
             cause = Some(e)
           )
         )
+    }
+  }
+
+  /** Coalesce mode requires parquet column types to match snapshot field types
+    * exactly. Spark's `coalesce(src, bf)` would otherwise widen to a common
+    * supertype (e.g. Int + Long → Long) and the writer would emit binlogs whose
+    * Arrow type no longer matches the Milvus field — Milvus would later misread
+    * them.
+    */
+  private[backfill] def validateCoalesceTypes(
+      backfillSchema: org.apache.spark.sql.types.StructType,
+      extraReadFields: Seq[
+        (String, Long, org.apache.spark.sql.types.StructField)
+      ]
+  ): Either[BackfillError, Unit] = {
+    val backfillTypes =
+      backfillSchema.fields.map(f => f.name -> f.dataType).toMap
+    val mismatches = extraReadFields.collect {
+      case (name, _, srcField)
+          if backfillTypes
+            .get(name)
+            .exists(_ != srcField.dataType) =>
+        s"$name (snapshot=${srcField.dataType.simpleString}, " +
+          s"parquet=${backfillTypes(name).simpleString})"
+    }
+    if (mismatches.nonEmpty) {
+      Left(
+        SchemaValidationError(
+          s"--mode=${MilvusOption.BackfillModeCoalesce} requires backfill " +
+            s"parquet column types to match snapshot field types exactly. " +
+            s"Mismatched: ${mismatches.mkString(", ")}"
+        )
+      )
+    } else {
+      Right(())
     }
   }
 
