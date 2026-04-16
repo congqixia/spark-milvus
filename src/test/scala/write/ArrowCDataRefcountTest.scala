@@ -15,12 +15,19 @@ import org.apache.arrow.vector.{
   BitVector,
   FixedSizeBinaryVector,
   Float4Vector,
+  Float8Vector,
   IntVector,
+  SmallIntVector,
+  TinyIntVector,
   VarBinaryVector,
   VarCharVector,
   VectorSchemaRoot
 }
-import org.apache.arrow.vector.complex.{FixedSizeListVector, ListVector}
+import org.apache.arrow.vector.complex.{
+  FixedSizeListVector,
+  ListVector,
+  StructVector
+}
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, FieldType, Schema}
 import org.apache.arrow.vector.types.FloatingPointPrecision
 import org.scalatest.funsuite.AnyFunSuite
@@ -37,14 +44,23 @@ import org.scalatest.matchers.should.Matchers
   * retaining every root until the writer closes (which caused per-segment
   * direct-memory growth proportional to row count).
   *
-  * The tests cover the field types the backfill V2 path emits:
-  *   - fixed-width primitive (Int32, Int64, Float32)
+  * The tests cover the Arrow types emitted by `MilvusSchemaUtil
+  * .convertSparkSchemaToArrow` (the schema converter used by both writers):
+  *   - fixed-width primitives: Int8, Int16, Int32, Int64, Float32, Float64
   *   - boolean (bit-packed validity + value)
-  *   - variable-width (Utf8, Binary)
-  *   - fixed-size binary
-  *   - FixedSizeList<Float> (embedded vectors)
-  *   - List<Int> (variable-length array)
-  *   - nullable columns (validity bitmap must survive close + import)
+  *   - variable-width: Utf8, Binary
+  *   - FixedSizeBinary (the backfill path's representation of dense float
+  *     vectors)
+  *   - FixedSizeList<Float> (alternative embedded-vector representation)
+  *   - List<Int>, List<Utf8> (variable-length arrays with both fixed- and
+  *     variable-width children)
+  *   - Struct<Int64, Utf8> (nested fields with independent buffers)
+  *   - nullable validity bitmaps across all of the above
+  *
+  * Arrow's Map type is not exercised directly because it is physically encoded
+  * as `List<Struct<key, value>>`; the refcount property for Map follows from
+  * the List and Struct cases combined with Arrow C Data Interface's uniform
+  * buffer-ownership model.
   *
   * Each test round-trips data through export → close(source) → import and
   * verifies byte-for-byte equality.
@@ -186,6 +202,90 @@ class ArrowCDataRefcountTest extends AnyFunSuite with Matchers {
       v.isNull(3) shouldBe true
       v.get(4) shouldBe Float.PositiveInfinity
       java.lang.Float.isNaN(v.get(5)) shouldBe true
+    }
+  }
+
+  test("Float64 with NaN / infinities and nulls: round-trip preserves bits") {
+    val field = new Field(
+      "f64",
+      FieldType.nullable(
+        new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)
+      ),
+      null
+    )
+    roundTrip(
+      field,
+      populate = { root =>
+        val v = root.getVector("f64").asInstanceOf[Float8Vector]
+        v.allocateNew(6)
+        v.setSafe(0, 1.25)
+        v.setNull(1)
+        v.setSafe(2, -0.0)
+        v.setSafe(3, Double.PositiveInfinity)
+        v.setSafe(4, Double.NegativeInfinity)
+        v.setSafe(5, Double.NaN)
+        v.setValueCount(6)
+      },
+      rowCount = 6
+    ) { root =>
+      val v = root.getVector("f64").asInstanceOf[Float8Vector]
+      v.get(0) shouldBe 1.25
+      v.isNull(1) shouldBe true
+      java.lang.Double.doubleToRawLongBits(v.get(2)) shouldBe
+        java.lang.Double.doubleToRawLongBits(-0.0)
+      v.get(3) shouldBe Double.PositiveInfinity
+      v.get(4) shouldBe Double.NegativeInfinity
+      java.lang.Double.isNaN(v.get(5)) shouldBe true
+    }
+  }
+
+  test("Int16 (ShortType) boundary values round-trip") {
+    val field =
+      new Field("i16", FieldType.nullable(new ArrowType.Int(16, true)), null)
+    val values: Seq[java.lang.Short] =
+      Seq[Short](0, 1, -1, Short.MaxValue, Short.MinValue, 42).map(
+        java.lang.Short.valueOf
+      )
+    roundTrip(
+      field,
+      populate = { root =>
+        val v = root.getVector("i16").asInstanceOf[SmallIntVector]
+        v.allocateNew(values.length + 1)
+        values.zipWithIndex.foreach { case (x, i) =>
+          v.setSafe(i, x.shortValue)
+        }
+        v.setNull(values.length)
+        v.setValueCount(values.length + 1)
+      },
+      rowCount = values.length + 1
+    ) { root =>
+      val v = root.getVector("i16").asInstanceOf[SmallIntVector]
+      values.zipWithIndex.foreach { case (x, i) =>
+        v.get(i) shouldBe x.shortValue
+      }
+      v.isNull(values.length) shouldBe true
+    }
+  }
+
+  test("Int8 (ByteType) boundary values round-trip") {
+    val field =
+      new Field("i8", FieldType.nullable(new ArrowType.Int(8, true)), null)
+    val values: Seq[Byte] =
+      Seq[Byte](0, 1, -1, Byte.MaxValue, Byte.MinValue, 42)
+    roundTrip(
+      field,
+      populate = { root =>
+        val v = root.getVector("i8").asInstanceOf[TinyIntVector]
+        v.allocateNew(values.length + 1)
+        values.zipWithIndex.foreach { case (x, i) => v.setSafe(i, x) }
+        v.setNull(values.length)
+        v.setValueCount(values.length + 1)
+      },
+      rowCount = values.length + 1
+    ) { root =>
+      val v = root.getVector("i8").asInstanceOf[TinyIntVector]
+      values.zipWithIndex.foreach { case (x, i) => v.get(i) shouldBe x }
+      v.isNull(values.length) shouldBe true
     }
   }
 
@@ -427,6 +527,113 @@ class ArrowCDataRefcountTest extends AnyFunSuite with Matchers {
           (0 until xs.length).foreach { k =>
             inner.get(start + k) shouldBe xs(k)
           }
+      }
+    }
+  }
+
+  test(
+    "List<Utf8>: list with a variable-width child preserves offsets and data"
+  ) {
+    val listType = new ArrowType.List()
+    val child =
+      new Field("$data$", FieldType.nullable(new ArrowType.Utf8()), null)
+    val field =
+      new Field("ls", FieldType.nullable(listType), java.util.List.of(child))
+
+    val rows: Seq[Seq[String]] = Seq(
+      Seq("a", "bb", "ccc"),
+      Seq.empty,
+      null,
+      Seq("日本語", ""),
+      Seq("a longer string used to grow the child buffer")
+    )
+
+    roundTrip(
+      field,
+      populate = { root =>
+        val v = root.getVector("ls").asInstanceOf[ListVector]
+        val inner = v.getDataVector.asInstanceOf[VarCharVector]
+        inner.allocateNew(1024L, 16)
+        v.allocateNew()
+
+        var flat = 0
+        rows.zipWithIndex.foreach {
+          case (null, i) =>
+            v.setNull(i)
+          case (xs, i) =>
+            v.startNewValue(i)
+            xs.foreach { s =>
+              inner.setSafe(flat, s.getBytes(StandardCharsets.UTF_8))
+              flat += 1
+            }
+            v.endValue(i, xs.length)
+        }
+        inner.setValueCount(flat)
+        v.setValueCount(rows.length)
+      },
+      rowCount = rows.length
+    ) { root =>
+      val v = root.getVector("ls").asInstanceOf[ListVector]
+      val inner = v.getDataVector.asInstanceOf[VarCharVector]
+      rows.zipWithIndex.foreach {
+        case (null, i) => v.isNull(i) shouldBe true
+        case (xs, i) =>
+          v.isNull(i) shouldBe false
+          val start = v.getOffsetBuffer.getInt(i.toLong * 4)
+          val end = v.getOffsetBuffer.getInt((i.toLong + 1) * 4)
+          (end - start) shouldBe xs.length
+          xs.zipWithIndex.foreach { case (s, k) =>
+            new String(inner.get(start + k), StandardCharsets.UTF_8) shouldBe s
+          }
+      }
+    }
+  }
+
+  test(
+    "Struct<Int64, Utf8>: nested fields preserve buffers independently"
+  ) {
+    val children = java.util.List.of(
+      new Field("k", FieldType.notNullable(new ArrowType.Int(64, true)), null),
+      new Field("v", FieldType.nullable(new ArrowType.Utf8()), null)
+    )
+    val field =
+      new Field("s", FieldType.nullable(new ArrowType.Struct()), children)
+
+    val rows: Seq[(Long, String)] = Seq(
+      (100L, "alpha"),
+      (200L, null),
+      (300L, "日本語"),
+      (400L, "")
+    )
+
+    roundTrip(
+      field,
+      populate = { root =>
+        val sv = root.getVector("s").asInstanceOf[StructVector]
+        sv.allocateNew()
+        val kv = sv.getChild("k", classOf[BigIntVector])
+        val vv = sv.getChild("v", classOf[VarCharVector])
+
+        rows.zipWithIndex.foreach { case ((k, s), i) =>
+          sv.setIndexDefined(i)
+          kv.setSafe(i, k)
+          if (s == null) vv.setNull(i)
+          else vv.setSafe(i, s.getBytes(StandardCharsets.UTF_8))
+        }
+        kv.setValueCount(rows.length)
+        vv.setValueCount(rows.length)
+        sv.setValueCount(rows.length)
+      },
+      rowCount = rows.length
+    ) { root =>
+      val sv = root.getVector("s").asInstanceOf[StructVector]
+      val kv = sv.getChild("k", classOf[BigIntVector])
+      val vv = sv.getChild("v", classOf[VarCharVector])
+      rows.zipWithIndex.foreach { case ((k, s), i) =>
+        sv.isNull(i) shouldBe false
+        kv.get(i) shouldBe k
+        if (s == null) vv.isNull(i) shouldBe true
+        else new String(vv.get(i), StandardCharsets.UTF_8) shouldBe s
       }
     }
   }

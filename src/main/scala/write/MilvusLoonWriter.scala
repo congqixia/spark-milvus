@@ -403,14 +403,25 @@ class MilvusLoonPartitionWriter(
       allocateVectors(newRoot)
     } catch {
       case t: Throwable =>
-        try newRoot.close()
-        catch { case _: Throwable => /* swallow secondary cleanup error */ }
+        Try(newRoot.close()).recover { case e: Exception =>
+          logError(
+            s"Error closing newRoot after allocation failure: ${e.getMessage}"
+          )
+        }
         throw t
     }
     val oldRoot = root
     root = newRoot
     currentBatchSize = 0
-    oldRoot.close()
+    // Best-effort: the native write already succeeded and the batch is durable.
+    // Throwing out of flushBatch here would escape to Spark, trigger task retry,
+    // and duplicate the write. Log and continue — the allocator will still
+    // reclaim buffers once the C++ writer flushes its cached shared_ptrs.
+    Try(oldRoot.close()).recover { case e: Exception =>
+      logError(
+        s"Error closing old VectorSchemaRoot after flush: ${e.getMessage}"
+      )
+    }
   }
 
   /** Allocate or reallocate vectors for the given root. Takes the root as a
