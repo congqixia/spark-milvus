@@ -65,10 +65,25 @@ object MilvusSegmentManifestReader extends Logging {
     */
   private val SchemaResource = "/milvus-segment-manifest.avsc"
 
-  /** Parsed lazily once. `Schema.Parser` is not thread-safe but the parsed
-    * `Schema` is immutable, so lazy val is fine.
+  /** The last field we read from each AVRO record. Avro binary is positional
+    * and has no container header here, so the reader schema must match the
+    * writer schema exactly for whatever it parses. By stopping at
+    * `binlog_files` (the last field backfill actually uses) we make all
+    * trailing fields — present or absent — effectively optional: extra bytes
+    * after this field are simply ignored, and writers that emit fewer trailing
+    * fields still decode because the prefix they share with us is identical.
+    * Update this if backfill starts consuming a later field.
     */
-  private lazy val schema: Schema = {
+  private val LastNeededField = "binlog_files"
+
+  /** Parsed lazily once. `Schema.Parser` is not thread-safe but the parsed
+    * `Schema` is immutable, so lazy val is fine. We truncate the bundled
+    * schema to the prefix ending at `LastNeededField` so trailing fields are
+    * treated as optional across milvus versions.
+    */
+  private lazy val schema: Schema = truncatedSchema(fullSchema, LastNeededField)
+
+  private lazy val fullSchema: Schema = {
     val in = Option(getClass.getResourceAsStream(SchemaResource)).getOrElse {
       throw new IllegalStateException(
         s"bundled AVSC resource $SchemaResource not found on classpath"
@@ -81,6 +96,30 @@ object MilvusSegmentManifestReader extends Logging {
     } finally {
       in.close()
     }
+  }
+
+  /** Build a record schema containing only the prefix of `full`'s fields up to
+    * and including `lastField`. Field objects are reconstructed so the new
+    * record owns them (avro forbids a field being attached to two records).
+    */
+  private def truncatedSchema(full: Schema, lastField: String): Schema = {
+    val idx = full.getFields.asScala.indexWhere(_.name == lastField)
+    if (idx < 0) {
+      throw new IllegalStateException(
+        s"bundled AVSC $SchemaResource is missing required field '$lastField'"
+      )
+    }
+    val truncated = Schema.createRecord(
+      full.getName,
+      full.getDoc,
+      full.getNamespace,
+      full.isError
+    )
+    val prefixFields = full.getFields.asScala.take(idx + 1).map { f =>
+      new Schema.Field(f.name, f.schema, f.doc, f.defaultVal)
+    }
+    truncated.setFields(prefixFields.toList.asJava)
+    truncated
   }
 
   /** Decode the raw bytes of one per-segment `*.avro` file into the subset of
