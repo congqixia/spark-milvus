@@ -77,9 +77,9 @@ object MilvusSegmentManifestReader extends Logging {
   private val LastNeededField = "binlog_files"
 
   /** Parsed lazily once. `Schema.Parser` is not thread-safe but the parsed
-    * `Schema` is immutable, so lazy val is fine. We truncate the bundled
-    * schema to the prefix ending at `LastNeededField` so trailing fields are
-    * treated as optional across milvus versions.
+    * `Schema` is immutable, so lazy val is fine. We truncate the bundled schema
+    * to the prefix ending at `LastNeededField` so trailing fields are treated
+    * as optional across milvus versions.
     */
   private lazy val schema: Schema = truncatedSchema(fullSchema, LastNeededField)
 

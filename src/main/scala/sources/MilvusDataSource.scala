@@ -528,6 +528,15 @@ class MilvusScanBuilder(
   }
 
   override def pushFilters(filters: Array[Filter]): Array[Filter] = {
+    // V2 packed reader does not apply filters server-side yet — return all
+    // as unsupported so Spark applies them post-read.
+    // TODO: implement filter pushdown for V2 packed reader in a separate PR.
+    val isPackedV2 = Option(options.get(MilvusOption.SnapshotV2Segments))
+      .exists(_.nonEmpty)
+    if (isPackedV2) {
+      pushedFilterArray = Array.empty
+      return filters
+    }
     val (supportedFilters, unsupportedFilters) =
       filters.partition(isSupportedFilter)
     pushedFilterArray = supportedFilters

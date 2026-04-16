@@ -217,7 +217,9 @@ class MilvusLoonV2PartitionReader(
     }
     if (arrowSchemaObj != null) {
       try arrowSchemaObj.close()
-      catch { case e: Throwable => logWarning("close arrowSchemaObj failed", e) }
+      catch {
+        case e: Throwable => logWarning("close arrowSchemaObj failed", e)
+      }
       arrowSchemaObj = null
     }
     if (readerProperties != null) {

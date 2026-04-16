@@ -7,8 +7,8 @@ import org.apache.arrow.c.{ArrowArray, ArrowSchema, Data}
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector.{
   BaseVariableWidthVector,
-  VectorSchemaRoot,
-  VarCharVector
+  VarCharVector,
+  VectorSchemaRoot
 }
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
@@ -47,15 +47,15 @@ case class V2BinlogFile(
   *   {rootPath}/insert_log/{coll}/{part}/{seg}/{fieldID}/{logID}
   * }}}
   *
-  * Files are produced via milvus-storage's [[io.milvus.storage.MilvusPackedWriter]]
-  * (the JNI wrapper around C++ `PackedRecordBatchWriter`), so the on-disk
-  * footer carries milvus-storage's full KV metadata trio:
+  * Files are produced via milvus-storage's
+  * [[io.milvus.storage.MilvusPackedWriter]] (the JNI wrapper around C++
+  * `PackedRecordBatchWriter`), so the on-disk footer carries milvus-storage's
+  * full KV metadata trio:
   *   - `row_group_metadata` (per-row-group memsize/rownum/offset)
   *   - `storage_version = "1.0.0"`
   *   - `group_field_id_list = "{fieldID}"`
-  * matching what Milvus's compaction worker produces — so the resulting
-  * segment loads cleanly via `FileRowGroupReader::Make` /
-  * `PackedFileMetadata::Make`.
+  * matching what Milvus's compaction worker produces — so the resulting segment
+  * loads cleanly via `FileRowGroupReader::Make` / `PackedFileMetadata::Make`.
   *
   * The writer is NOT thread-safe; create one per segment on the executor.
   *
@@ -207,9 +207,11 @@ class MilvusV2BinlogWriter(
 
     // Every field receives the same row count: each Spark row produces one
     // value in every field's parquet (single-field column groups).
-    fields.map(f =>
-      V2BinlogFile(f.fieldId, f.logId, f.bucketRelativePath, totalRows)
-    ).toSeq
+    fields
+      .map(f =>
+        V2BinlogFile(f.fieldId, f.logId, f.bucketRelativePath, totalRows)
+      )
+      .toSeq
   }
 
   /** Abort: best-effort destroy + resource release. Errors are logged, not
