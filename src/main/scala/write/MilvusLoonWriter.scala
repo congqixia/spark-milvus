@@ -217,7 +217,7 @@ class MilvusLoonPartitionWriter(
   private var totalRecordCount = 0L
 
   // Allocate initial capacity for vectors
-  allocateVectors()
+  allocateVectors(root)
 
   // Base path for writing - use custom path if provided, otherwise generate
   private val basePath = {
@@ -390,25 +390,39 @@ class MilvusLoonPartitionWriter(
       arrowArrayC.close()
     }
 
+    // Fully build + allocate the replacement root BEFORE swapping `root`, so
+    // that if allocation throws, the field still points at the old root and
+    // cleanup() can release it. Otherwise an allocation failure mid-swap would
+    // leak the half-allocated newRoot and forget the old one.
+    //
     // Old root's buffers are referenced only by C++ via the export's retained
-    // ref. Closing here drops the JVM ref — buffers stay alive until C++
-    // flushes its cached shared_ptr. Swap in a fresh root before closing so
-    // that if close() misbehaves, cleanup() still has a valid `root` handle.
+    // ref, so closing `oldRoot` at the end just drops the JVM ref — buffers
+    // stay alive until C++ flushes its cached shared_ptr.
+    val newRoot = VectorSchemaRoot.create(arrowSchema, allocator)
+    try {
+      allocateVectors(newRoot)
+    } catch {
+      case t: Throwable =>
+        try newRoot.close()
+        catch { case _: Throwable => /* swallow secondary cleanup error */ }
+        throw t
+    }
     val oldRoot = root
-    root = VectorSchemaRoot.create(arrowSchema, allocator)
-    allocateVectors()
+    root = newRoot
     currentBatchSize = 0
     oldRoot.close()
   }
 
-  /** Allocate or reallocate vectors for the current batch
+  /** Allocate or reallocate vectors for the given root. Takes the root as a
+    * parameter so callers can fully prepare a fresh VectorSchemaRoot before
+    * committing it to the `root` field.
     */
-  private def allocateVectors(): Unit = {
+  private def allocateVectors(r: VectorSchemaRoot): Unit = {
     import scala.collection.JavaConverters._
     import org.apache.arrow.vector.{VarCharVector, BaseVariableWidthVector}
 
     // For each vector, set appropriate initial capacity
-    root.getFieldVectors.asScala.foreach { vector =>
+    r.getFieldVectors.asScala.foreach { vector =>
       vector match {
         case varCharVector: VarCharVector =>
           // For VarChar vectors, allocate both row capacity and byte capacity
@@ -429,8 +443,8 @@ class MilvusLoonPartitionWriter(
       }
     }
 
-    root.allocateNew()
-    root.setRowCount(0)
+    r.allocateNew()
+    r.setRowCount(0)
   }
 
   /** Generate S3 base path for this writer

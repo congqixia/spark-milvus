@@ -246,14 +246,25 @@ class MilvusV2BinlogWriter(
       cArray.close()
     }
 
+    // Fully build + allocate the replacement root BEFORE swapping `root`, so
+    // that if allocation throws, the field still points at the old root and
+    // cleanup() can release it. Otherwise an allocation failure mid-swap would
+    // leak the half-allocated newRoot and forget the old one.
+    //
     // Old root's buffers are now referenced only by C++ via the export's
-    // retained ref. Closing here just drops the JVM ref — buffers stay alive
-    // until C++ flushes the cached shared_ptr. Swap in a fresh root before
-    // closing so that if close() misbehaves, cleanup() still operates on a
-    // valid `root` handle.
+    // retained ref, so closing `oldRoot` at the end just drops the JVM ref —
+    // buffers stay alive until C++ flushes the cached shared_ptr.
+    val newRoot = VectorSchemaRoot.create(arrowSchema, allocator)
+    try {
+      allocateVectors(newRoot)
+    } catch {
+      case t: Throwable =>
+        try newRoot.close()
+        catch { case _: Throwable => /* swallow secondary cleanup error */ }
+        throw t
+    }
     val oldRoot = root
-    root = VectorSchemaRoot.create(arrowSchema, allocator)
-    allocateVectors(root)
+    root = newRoot
     currentBatchSize = 0
     oldRoot.close()
   }
