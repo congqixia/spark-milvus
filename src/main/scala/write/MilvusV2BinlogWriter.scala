@@ -180,7 +180,10 @@ class MilvusV2BinlogWriter(
     */
   def write(row: InternalRow): Unit = {
     if (closed) throw new IllegalStateException("writer already closed")
-    ArrowConverter.internalRowToArrow(root, currentBatchSize, row, targetSchema)
+    // DEBUG: defensive copy to rule out upstream UnsafeRow buffer reuse
+    // (post-shuffle / vectorized-parquet-reader UTF8String alias).
+    val safeRow = row.copy()
+    ArrowConverter.internalRowToArrow(root, currentBatchSize, safeRow, targetSchema)
     currentBatchSize += 1
     root.setRowCount(currentBatchSize)
     if (currentBatchSize >= batchSize) {

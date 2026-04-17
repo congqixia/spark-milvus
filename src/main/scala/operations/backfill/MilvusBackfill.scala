@@ -1093,7 +1093,10 @@ object MilvusBackfill {
       var nullRowCount = 0L
       var matchedRowCount = 0L
 
-      def writeRow(row: InternalRow): Unit = {
+      def writeRow(rawRow: InternalRow): Unit = {
+        // DEBUG: defensive copy to rule out upstream UnsafeRow buffer reuse
+        // (post-shuffle / vectorized-parquet-reader UTF8String alias).
+        val row = rawRow.copy()
         // Row layout: [segment_id, row_offset, ...newFields, __bf_matched__]
         // Strip the first two tracking cols and the trailing match flag before
         // handing values to the writer.
@@ -1316,7 +1319,10 @@ object MilvusBackfill {
       // The V2 writer only wants the newField columns; strip the tracking
       // columns and the match flag (the flag is instead folded into
       // matchedRowCount).
-      def projected(row: InternalRow): InternalRow = {
+      def projected(rawRow: InternalRow): InternalRow = {
+        // DEBUG: defensive copy to rule out upstream UnsafeRow buffer reuse
+        // (post-shuffle / vectorized-parquet-reader UTF8String alias).
+        val row = rawRow.copy()
         val matchFlagIdx = row.numFields - 1
         val dataEnd = matchFlagIdx
         val values = (2 until dataEnd)
