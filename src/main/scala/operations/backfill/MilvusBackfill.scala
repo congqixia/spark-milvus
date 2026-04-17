@@ -73,6 +73,10 @@ object MilvusBackfill {
       case Right(_) => // Continue
     }
 
+    // Tracked so we can unpersist in the outer finally, even on mid-flight
+    // failure (the cache is taken right after column mapping, below).
+    var cachedBackfillDF: DataFrame = null
+
     logger.info(s"Backfill mode: ${config.mode}")
 
     // Step 1: Try to load snapshot metadata
@@ -163,18 +167,60 @@ object MilvusBackfill {
         case Right(df)   => df
       }
 
-      // One extra parquet scan so the result can report the raw input row
-      // count alongside snapshot / matched counts — useful when debugging
-      // low join-match rates (e.g. data file has keys that aren't in the
-      // collection).
-      val backfillRowCount = backfillDF.count()
-      logger.info(s"Backfill data file rows: $backfillRowCount")
+      // Cache so the upcoming count / distinct-PK aggregation doesn't force
+      // a second parquet scan when performJoin consumes the DF later. Held
+      // until after processSegments (see finally block for unpersist).
+      backfillDF.cache()
+      cachedBackfillDF = backfillDF
 
       // Extract new field names (all post-mapping columns except the PK).
       val newFieldNames = backfillDF.schema.fields
         .map(_.name)
         .filterNot(_ == pkName)
         .toSeq
+
+      // Reject a backfill column named MatchFlagCol: the join adds a
+      // lit(true) marker under that name, which would silently overwrite a
+      // user column (overwrite mode) or blow up with AnalysisException on
+      // the coalesce rename/self-reference (coalesce mode).
+      if (newFieldNames.contains(MatchFlagCol)) {
+        return Left(
+          SchemaValidationError(
+            s"Backfill parquet contains a column named '$MatchFlagCol', " +
+              "which is reserved for internal use by the backfill join. " +
+              "Rename the column (or use --column-mapping) and retry."
+          )
+        )
+      }
+
+      // One aggregation over the cached DF gives us both totals: the raw
+      // input row count (reported in the result / logs for debugging low
+      // match rates) and the distinct-PK count (used below to fail fast on
+      // duplicates — see rationale there).
+      val countsRow = backfillDF
+        .agg(count(lit(1)), countDistinct(col(pkName)))
+        .head()
+      val backfillRowCount = countsRow.getLong(0)
+      val distinctPkCount = countsRow.getLong(1)
+      logger.info(
+        s"Backfill data file rows: $backfillRowCount " +
+          s"(distinct ${pkName}: $distinctPkCount)"
+      )
+
+      // Duplicate PKs on the backfill side cause each source row with a
+      // matching PK to be emitted once per duplicate by the left join,
+      // inflating per-segment rowCount / sourceRowCount / matchedRowCount.
+      // Rather than silently report misleading metrics, fail fast so the
+      // user can dedupe upstream.
+      if (distinctPkCount != backfillRowCount) {
+        return Left(
+          SchemaValidationError(
+            s"Backfill parquet contains duplicate primary-key values " +
+              s"(rows=$backfillRowCount, distinct ${pkName}=$distinctPkCount). " +
+              "Deduplicate the input (e.g. dropDuplicates on the PK) and retry."
+          )
+        )
+      }
 
       // Build field name -> field ID mapping from collection schema. Resolved
       // early (was post-join) so coalesce mode can ask the reader to also
@@ -336,6 +382,14 @@ object MilvusBackfill {
         } catch {
           case e: Exception =>
             logger.warn("Failed to close Milvus client", e)
+        }
+      }
+      if (cachedBackfillDF != null) {
+        try {
+          cachedBackfillDF.unpersist()
+        } catch {
+          case e: Exception =>
+            logger.warn("Failed to unpersist backfill DataFrame", e)
         }
       }
     }
