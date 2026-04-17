@@ -183,6 +183,30 @@ class MilvusV2BinlogWriter(
     // DEBUG: defensive copy to rule out upstream UnsafeRow buffer reuse
     // (post-shuffle / vectorized-parquet-reader UTF8String alias).
     val safeRow = row.copy()
+
+    // DEBUG [BF_SAMPLE_S6_V2WRITER]: log samples at specific absolute row
+    // positions so we can correlate input → parquet output. absoluteRow is
+    // the row index in the final binlog parquet, not the batch-local index.
+    val absoluteRow = totalRows + currentBatchSize
+    if (
+      absoluteRow == 0L || absoluteRow == 1L || absoluteRow == 63L ||
+      absoluteRow == 1000L || absoluteRow == 8192L ||
+      absoluteRow == 120317L
+    ) {
+      val rendered = (0 until targetSchema.fields.length).map { i =>
+        val f = targetSchema.fields(i)
+        val v =
+          if (safeRow.isNullAt(i)) "null"
+          else
+            try { safeRow.get(i, f.dataType).toString }
+            catch { case _: Throwable => "?" }
+        s"${f.name}=$v"
+      }.mkString(" | ")
+      logInfo(
+        s"[BF_SAMPLE_S6_V2WRITER] seg=$segmentId absRow=$absoluteRow batchIdx=$currentBatchSize $rendered"
+      )
+    }
+
     ArrowConverter.internalRowToArrow(root, currentBatchSize, safeRow, targetSchema)
     currentBatchSize += 1
     root.setRowCount(currentBatchSize)

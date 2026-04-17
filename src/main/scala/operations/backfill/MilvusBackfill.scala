@@ -36,6 +36,38 @@ object MilvusBackfill {
 
   private val logger = LoggerFactory.getLogger(getClass)
 
+  /** DEBUG: row_offsets we sample at every pipeline stage to bisect where
+    * data misalignment is introduced. Grep `BF_SAMPLE` in driver + executor
+    * logs; every stage emits one line per (segment, row_offset) match.
+    */
+  private val DebugSampleRowOffsets: Set[Long] =
+    Set(0L, 1L, 63L, 100L, 1000L, 8192L, 10000L, 100000L, 120317L)
+
+  /** Format an InternalRow for debug sampling. Types are resolved from an
+    * optional schema; unknown-typed fields fall back to the raw `.get` result.
+    */
+  private[backfill] def bfSampleFormatRow(
+      row: org.apache.spark.sql.catalyst.InternalRow,
+      schema: Option[org.apache.spark.sql.types.StructType]
+  ): String = {
+    val n = row.numFields
+    val parts = (0 until n).map { i =>
+      val v =
+        try {
+          schema match {
+            case Some(s) if i < s.fields.length =>
+              if (row.isNullAt(i)) "null"
+              else row.get(i, s.fields(i).dataType).toString
+            case _ => row.get(i, null).toString
+          }
+        } catch {
+          case _: Throwable => "?"
+        }
+      s"[$i]=$v"
+    }
+    parts.mkString(" | ")
+  }
+
   /** Marker column added to the backfill side before the left join so we can
     * count how many source rows found a PK match (non-null marker → matched).
     * Kept on the DataFrame all the way down to the per-segment partition
@@ -320,6 +352,33 @@ object MilvusBackfill {
         newFieldNames,
         config.mode
       )
+
+      // DEBUG [BF_SAMPLE_S1_POST_JOIN]: sample joined rows at known
+      // row_offsets so we can compare pk <-> newField pairing before
+      // projection strips pk. Logs on driver.
+      try {
+        val debugOffsets = DebugSampleRowOffsets.toSeq
+          .map(java.lang.Long.valueOf)
+        val sampled = joinedDF
+          .filter(col("row_offset").isin(debugOffsets: _*))
+          .limit(500)
+          .collect()
+        logger.info(
+          s"[BF_SAMPLE_S1_POST_JOIN] schema=${joinedDF.schema.fieldNames.mkString(",")} collected=${sampled.length}"
+        )
+        sampled.foreach { r =>
+          val kv = r.schema.fieldNames
+            .zip(r.toSeq)
+            .map { case (k, v) => s"$k=$v" }
+            .mkString(" | ")
+          logger.info(s"[BF_SAMPLE_S1_POST_JOIN] $kv")
+        }
+      } catch {
+        case e: Throwable =>
+          logger.warn(
+            s"[BF_SAMPLE_S1_POST_JOIN] sampling failed: ${e.getMessage}"
+          )
+      }
 
       // Step 4: Get collection metadata (collectionID, segment-to-partition mapping, base paths)
       val (collectionID, segmentToPartitionMap, segmentBasePathMap) =
@@ -915,19 +974,75 @@ object MilvusBackfill {
       val segmentIds = segmentToPartitionMap.keys.toArray
       val segmentPartitioner = new SegmentPartitioner(segmentIds)
 
+      // DEBUG: freeze the sample offset set + preparedDF schema so the
+      // executor-side closures can format rows without pulling `this` in.
+      val debugSampleOffsets = DebugSampleRowOffsets
+      val preparedSchema = preparedDF.schema
+
       // Repartition using custom partitioner, then sort by row_offset within each partition
       // CRITICAL: .copy() is required because queryExecution.toRdd produces an iterator
       // that reuses the same UnsafeRow buffer. Without copy, keyBy/partitionBy's
       // ExternalSorter stores references to the same mutable buffer, causing all
       // rows to contain the last row's data.
       val repartitionedRDD = preparedDF.queryExecution.toRdd
-        .map(_.copy()) // Materialize each row to avoid UnsafeRow reuse
+        .map { raw =>
+          val copied = raw.copy()
+          // DEBUG [BF_SAMPLE_S2_PRE_SHUFFLE]: log rows at known row_offsets
+          // after .copy() but before shuffle. Executor-side logging.
+          val ro = copied.getLong(1)
+          if (debugSampleOffsets.contains(ro)) {
+            val seg = copied.getLong(0)
+            val s =
+              bfSampleFormatRow(copied, Some(preparedSchema))
+            org.slf4j.LoggerFactory
+              .getLogger("BFSample")
+              .info(
+                s"[BF_SAMPLE_S2_PRE_SHUFFLE] seg=$seg ro=$ro $s"
+              )
+          }
+          copied
+        } // Materialize each row to avoid UnsafeRow reuse
         .keyBy(_.getLong(0)) // segment_id is at index 0
         .partitionBy(segmentPartitioner)
         .values
-        .mapPartitions(iter =>
-          iter.toSeq.sortBy(_.getLong(1)).iterator
-        ) // Sort by row_offset
+        .mapPartitions { iter =>
+          // DEBUG [BF_SAMPLE_S3_POST_SHUFFLE_PRE_SORT]: log matching rows as
+          // they arrive from the shuffle reader, BEFORE the sortBy
+          // materialization. If this stage is right but post-sort is wrong,
+          // the `iter.toSeq` line introduces the bug.
+          val sampledIn = scala.collection.mutable.ArrayBuffer.empty[String]
+          val materialized = iter.map { r =>
+            val ro = r.getLong(1)
+            if (debugSampleOffsets.contains(ro)) {
+              val seg = r.getLong(0)
+              sampledIn += s"seg=$seg ro=$ro ${bfSampleFormatRow(r, Some(preparedSchema))}"
+            }
+            r
+          }.toSeq
+          sampledIn.foreach { line =>
+            org.slf4j.LoggerFactory
+              .getLogger("BFSample")
+              .info(s"[BF_SAMPLE_S3_POST_SHUFFLE_PRE_SORT] $line")
+          }
+
+          val sorted = materialized.sortBy(_.getLong(1))
+
+          // DEBUG [BF_SAMPLE_S4_POST_SORT]: log matching rows after sortBy
+          // materialization. Compare to S3: if they differ for the same
+          // row_offset, the sort step is corrupting.
+          sorted.foreach { r =>
+            val ro = r.getLong(1)
+            if (debugSampleOffsets.contains(ro)) {
+              val seg = r.getLong(0)
+              org.slf4j.LoggerFactory
+                .getLogger("BFSample")
+                .info(
+                  s"[BF_SAMPLE_S4_POST_SORT] seg=$seg ro=$ro ${bfSampleFormatRow(r, Some(preparedSchema))}"
+                )
+            }
+          }
+          sorted.iterator
+        } // Sort by row_offset
 
       // Broadcast configuration to executors
       val broadcastConfig = spark.sparkContext.broadcast(config)
@@ -1093,6 +1208,9 @@ object MilvusBackfill {
       var nullRowCount = 0L
       var matchedRowCount = 0L
 
+      // DEBUG: freeze sample offsets for the closure.
+      val debugSampleOffsets = DebugSampleRowOffsets
+
       def writeRow(rawRow: InternalRow): Unit = {
         // DEBUG: defensive copy to rule out upstream UnsafeRow buffer reuse
         // (post-shuffle / vectorized-parquet-reader UTF8String alias).
@@ -1105,6 +1223,21 @@ object MilvusBackfill {
         val targetFields = (2 until dataEnd)
           .map(i => row.get(i, targetSchema.fields(i - 2).dataType))
           .toArray
+
+        // DEBUG [BF_SAMPLE_S5_PRE_WRITE_V3]: log rows handed to the V3 writer.
+        val ro = row.getLong(1)
+        if (debugSampleOffsets.contains(ro)) {
+          val seg = row.getLong(0)
+          val rendered = targetFields.zipWithIndex
+            .map { case (v, i) => s"${targetSchema.fields(i).name}=$v" }
+            .mkString(" | ")
+          org.slf4j.LoggerFactory
+            .getLogger("BFSample")
+            .info(
+              s"[BF_SAMPLE_S5_PRE_WRITE_V3] seg=$seg ro=$ro rowCountBeforeThis=$rowCount $rendered"
+            )
+        }
+
         if (targetFields.forall(_ == null)) nullRowCount += 1
         if (!row.isNullAt(matchFlagIdx)) matchedRowCount += 1
         writer.write(
@@ -1319,6 +1452,9 @@ object MilvusBackfill {
       // The V2 writer only wants the newField columns; strip the tracking
       // columns and the match flag (the flag is instead folded into
       // matchedRowCount).
+      // DEBUG: freeze sample offsets for the closure below.
+      val debugSampleOffsets = DebugSampleRowOffsets
+
       def projected(rawRow: InternalRow): InternalRow = {
         // DEBUG: defensive copy to rule out upstream UnsafeRow buffer reuse
         // (post-shuffle / vectorized-parquet-reader UTF8String alias).
@@ -1328,6 +1464,22 @@ object MilvusBackfill {
         val values = (2 until dataEnd)
           .map(i => row.get(i, targetSchema.fields(i - 2).dataType))
           .toArray
+
+        // DEBUG [BF_SAMPLE_S5_PRE_WRITE_V2]: log rows handed to the V2
+        // writer. row layout is [segment_id, row_offset, ...newFields, flag].
+        val ro = row.getLong(1)
+        if (debugSampleOffsets.contains(ro)) {
+          val seg = row.getLong(0)
+          val rendered = values.zipWithIndex
+            .map { case (v, i) => s"${targetSchema.fields(i).name}=$v" }
+            .mkString(" | ")
+          org.slf4j.LoggerFactory
+            .getLogger("BFSample")
+            .info(
+              s"[BF_SAMPLE_S5_PRE_WRITE_V2] seg=$seg ro=$ro rowCountBeforeThis=$rowCount $rendered"
+            )
+        }
+
         new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(values)
       }
       def countMatch(row: InternalRow): Unit = {
