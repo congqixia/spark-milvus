@@ -55,6 +55,59 @@ object MilvusBackfill {
   private[backfill] def usedBfCol(field: String): String =
     s"__bf_used_bf_${field}__"
 
+  /** Resolve the debug PK switch from (in priority order): SparkConf key
+    * `spark.backfill.debugPk`, Java system property `backfill.debug.pk`, env
+    * var `BACKFILL_DEBUG_PK`. Returning "" disables the debug dumps entirely.
+    *
+    * The SparkConf path is the one we expect for on-cluster runs: pass
+    * `--conf spark.backfill.debugPk=<pk>` to spark-submit and the jar needs
+    * no changes. The other two are convenience fallbacks for local runs.
+    */
+  private def resolveDebugPk(spark: SparkSession): String = {
+    val fromConf =
+      try spark.sparkContext.getConf.getOption("spark.backfill.debugPk")
+      catch { case _: Throwable => None }
+    val fromProp = Option(System.getProperty("backfill.debug.pk"))
+    val fromEnv = Option(System.getenv("BACKFILL_DEBUG_PK"))
+    fromConf.orElse(fromProp).orElse(fromEnv).map(_.trim).getOrElse("")
+  }
+
+  /** Debug hook: when `debugPk` is non-empty, we filter each key DataFrame on
+    * `pkName == debugPk` and log every row, per column. Lets us see exactly
+    * what source / backfill / join output looked like for one specific PK
+    * without a full `.show()` that dumps the entire RDD. Intentionally uses
+    * `collect()` — the filter is narrow (single PK), and we want the values
+    * in the driver log, not executor stdout.
+    */
+  private def debugDumpRows(
+      df: DataFrame,
+      pkName: String,
+      debugPk: String,
+      label: String
+  ): Unit = {
+    if (debugPk.isEmpty) return
+    try {
+      val rows = df.filter(col(pkName) === lit(debugPk)).collect()
+      if (rows.isEmpty) {
+        logger.info(s"[DEBUG][$label] pk=$debugPk: no rows")
+      } else {
+        rows.zipWithIndex.foreach { case (r, i) =>
+          val cells = df.schema.fields.zipWithIndex.map {
+            case (f, idx) =>
+              val v = if (r.isNullAt(idx)) "null" else r.get(idx).toString
+              s"${f.name}=$v"
+          }
+          logger.info(
+            s"[DEBUG][$label] pk=$debugPk row#$i: ${cells.mkString(", ")}"
+          )
+        }
+      }
+    } catch {
+      case e: Throwable =>
+        logger.warn(s"[DEBUG][$label] dump failed for pk=$debugPk: ${e.getMessage}")
+    }
+  }
+
   /** Backfill new fields into a Milvus collection
     *
     * @param spark
@@ -184,6 +237,16 @@ object MilvusBackfill {
       // until after processSegments (see finally block for unpersist).
       backfillDF.cache()
       cachedBackfillDF = backfillDF
+
+      // Debug: dump a single PK's row from the backfill side (before the
+      // join / coalesce rewrites). Controlled by spark.backfill.debugPk
+      // conf (preferred) or the backfill.debug.pk / BACKFILL_DEBUG_PK
+      // fallbacks (see resolveDebugPk).
+      val debugPk = resolveDebugPk(spark)
+      if (debugPk.nonEmpty) {
+        logger.info(s"[DEBUG] backfill debugPk=$debugPk active")
+        debugDumpRows(backfillDF, pkName, debugPk, "backfill")
+      }
 
       // Extract new field names (all post-mapping columns except the PK).
       val newFieldNames = backfillDF.schema.fields
@@ -318,6 +381,12 @@ object MilvusBackfill {
         case Right(df)   => df
       }
 
+      // Debug: dump the raw source row for the target PK. This tells us
+      // whether the missing values were already null when the reader handed
+      // them back (i.e. the segment has no column group for the field) or
+      // only became null after the join / coalesce rewrites.
+      debugDumpRows(originalDF, pkName, debugPk, "source")
+
       // Validate schema compatibility
       validateSchemaCompatibility(originalDF, backfillDF, pkName) match {
         case Left(error) => return Left(error)
@@ -332,6 +401,12 @@ object MilvusBackfill {
         newFieldNames,
         config.mode
       )
+
+      // Debug: dump the post-join row. In coalesce mode this includes the
+      // per-field usedSrc/usedBf provenance flags and the final coalesced
+      // values, so we can tell for each new field whether it took the source
+      // value or fell back to the backfill data file.
+      debugDumpRows(joinedDF, pkName, debugPk, "joined")
 
       // Step 4: Get collection metadata (collectionID, segment-to-partition mapping, base paths)
       val (collectionID, segmentToPartitionMap, segmentBasePathMap) =
